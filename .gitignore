@@ -49,3 +49,10 @@ builds/**/images/*
 # security / ssl
 *.pem
 *.xxjson
+
+# Terraform State Files
+terraform.tfstate
+
+# mykey and mykey.pub ssh keys
+mykey
+mykey.pub
