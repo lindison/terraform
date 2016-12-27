@@ -52,6 +52,7 @@ builds/**/images/*
 
 # Terraform State Files
 terraform.tfstate
+terraform.tfstate.backup
 
 # mykey and mykey.pub ssh keys
 mykey
