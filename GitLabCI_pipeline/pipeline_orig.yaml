@@ -1,0 +1,206 @@
+image: docker:1.12
+
+services:
+  - wilreichert/docker:dind-1.12-insecure
+
+stages:
+  - app-build
+  - test-dev
+  - container-build
+  - promote-dev
+  - deploy-qa
+  - test-qa
+  - promote-qa
+  - cleanup-qa
+  - deploy-staging
+  - test-staging
+  - promote-staging
+  - cleanup-staging
+
+variables:
+  REG_HOST: "10.188.160.123:8083"
+  DOCKER_HOST: "tcp://wilreichert__docker:2375"
+  NEXUS_URL_BASE: "http://10.188.160.123:8081/nexus/service/local"
+  NEXUS_URL: "http://10.188.160.123:8081/nexus/service/local/artifact/maven"
+  SONAR_URL: "http://10.188.160.14:9000/sonar"
+  RELEASE_BRANCH: "ci-poc"
+
+before_script:
+  - docker login $REG_HOST -u $NEXUS_USERNAME -p $NEXUS_PASSWORD
+
+maven-build:
+  stage: app-build
+  script:
+    - docker run -v $PWD/.m2:/usr/share/maven/ref/repository -v $PWD:/root/workspace $REG_HOST/maven/maven:3.3.9-jdk1.8.0_25 /bin/bash -c "cd /root/workspace && mvn -U clean package"
+  cache:
+    paths:
+      - .m2/
+  artifacts:
+    expire_in: 1 day
+    paths:
+      - shoppingcart-service-main/target/shoppingcart-service.war
+      - shoppingcart-service-main/target/shoppingcart-service-bin-app-cartrt.tar.gz
+  environment:
+    name: dev
+  except:
+    - tags
+
+unit-test:
+  stage: test-dev
+  script:
+    - echo unit-test
+    - docker run -v $PWD/.m2:/usr/share/maven/ref/repository -v $PWD:/root/workspace $REG_HOST/maven/maven:3.3.9-jdk1.8.0_25 /bin/bash -c "cd /root/workspace && mvn -U test"
+    - docker run -v $PWD/.m2:/usr/share/maven/ref/repository -v $PWD:/root/workspace $REG_HOST/maven/maven:3.3.9-jdk1.8.0_25 /bin/bash -c "cd /root/workspace && mvn sonar:sonar -Dsonar.host.url=http://10.188.160.14:9000/sonar -Dsonar.analysis.mode=preview"
+  allow_failure: true
+  environment:
+    name: dev
+  except:
+    - tags
+
+docker-build:
+  stage: container-build
+  script:
+    - echo build
+    - docker build -t $REG_HOST/$CI_PROJECT_PATH:$CI_BUILD_REF .
+    - docker tag $REG_HOST/$CI_PROJECT_PATH:$CI_BUILD_REF $REG_HOST/$CI_PROJECT_PATH:$CI_BUILD_REF_NAME
+    - docker tag $REG_HOST/$CI_PROJECT_PATH:$CI_BUILD_REF $REG_HOST/$CI_PROJECT_PATH:dev-latest
+    - docker push $REG_HOST/$CI_PROJECT_PATH:$CI_BUILD_REF
+    - docker push $REG_HOST/$CI_PROJECT_PATH:$CI_BUILD_REF_NAME
+    - docker push $REG_HOST/$CI_PROJECT_PATH:dev-latest
+  environment:
+    name: dev
+  except:
+    - tags
+
+promote-on-dev:
+  stage: promote-dev
+  script:
+    - curl --fail -F r=dev -F hasPom=false -F e=war -F g=com.ticketmaster.cart -F a=shoppingcart-service -F v=$CI_BUILD_REF -F p=war -F file=@shoppingcart-service-main/target/shoppingcart-service.war -u $NEXUS_USERNAME:$NEXUS_PASSWORD $NEXUS_URL/content
+    - curl --fail -F r=dev -F hasPom=false -F e=tar.gz -F g=com.ticketmaster.cart -F a=shoppingcart-service-bin-app-cartrt -F v=$CI_BUILD_REF -F p=tar.gz -F file=@shoppingcart-service-main/target/shoppingcart-service-bin-app-cartrt.tar.gz -u $NEXUS_USERNAME:$NEXUS_PASSWORD $NEXUS_URL/content
+  environment:
+    name: dev
+  except:
+    - ci-poc@corch-hollywood-dev/cart-runtime
+    - tags
+
+promote-on-qa:
+  stage: promote-dev
+  script:
+    - curl --fail -F r=qa -F hasPom=false -F e=war -F g=com.ticketmaster.cart -F a=shoppingcart-service -F v=$CI_BUILD_REF -F p=war -F file=@shoppingcart-service-main/target/shoppingcart-service.war -u $NEXUS_USERNAME:$NEXUS_PASSWORD $NEXUS_URL/content
+    - curl --fail -F r=qa -F hasPom=false -F e=tar.gz -F g=com.ticketmaster.cart -F a=shoppingcart-service-bin-app-cartrt -F v=$CI_BUILD_REF -F p=tar.gz -F file=@shoppingcart-service-main/target/shoppingcart-service-bin-app-cartrt.tar.gz -u $NEXUS_USERNAME:$NEXUS_PASSWORD $NEXUS_URL/content
+  environment:
+    name: dev
+  only:
+    - ci-poc@corch-hollywood-dev/cart-runtime
+  except:
+    - tags
+
+deploy-to-qa:
+  stage: deploy-qa
+  script:
+    - docker run -t --rm -v $(pwd)/terraform:/cfg 10.188.160.123:8083/ticketmaster/terraformer tm-dev/ci-qa plan
+    - docker run -t --rm -v $(pwd)/terraform:/cfg 10.188.160.123:8083/ticketmaster/terraformer tm-dev/ci-qa apply
+  environment:
+    name: qa
+    url: https://cartrt.ci-poc.us-east-1.nonprod-tmaws.io
+  allow_failure: true
+  only:
+    - tags
+
+auto-test-on-qa:
+  stage: test-qa
+  script:
+    - echo "selenium start"
+  environment:
+    name: qa
+    on_stop: manual-test-on-qa
+  allow_failure: true
+  only:
+    - tags
+
+manual-test-on-qa:
+  stage: test-qa
+  script:
+    - echo "manual test"
+    - echo "preload data"
+  environment:
+    name: qa
+    action: stop
+  only:
+    - tags
+
+promote-to-qa:
+  stage: promote-qa
+  script:
+    - ./promote-artifact.sh qa staging
+  environment:
+    name: qa
+    action: stop
+  only:
+    - tags
+
+cleanup-on-qa:
+  stage: cleanup-qa
+  script:
+    - docker run -t --rm -v $(pwd)/terraform:/cfg 10.188.160.123:8083/ticketmaster/terraformer tm-dev/ci-qa -force destroy
+  environment:
+    name: qa
+  when: always
+  allow_failure: true
+  only:
+    - tags
+
+deploy-to-staging:
+  stage: deploy-staging
+  script:
+    - docker run -t --rm -v $(pwd)/terraform:/cfg 10.188.160.123:8083/ticketmaster/terraformer tm-dev/ci-stage plan
+    - docker run -t --rm -v $(pwd)/terraform:/cfg 10.188.160.123:8083/ticketmaster/terraformer tm-dev/ci-stage apply
+  environment:
+    name: staging
+    url: https://cartrt.ci-poc.us-east-1.nonprod-tmaws.io
+  allow_failure: true
+  only:
+    - tags
+
+auto-test-on-staging:
+  stage: test-staging
+  script:
+    - echo "gatling start"
+  environment:
+    name: staging
+    on_stop: manual-test-on-staging
+  allow_failure: true
+  only:
+    - tags
+
+manual-test-on-staging:
+  stage: test-staging
+  script:
+    - echo "manual test"
+  environment:
+    name: staging
+    action: stop
+  only:
+    - tags
+
+promote-to-staging:
+  stage: promote-staging
+  script:
+    - ./promote-artifact.sh staging release
+  environment:
+    name: staging
+    action: stop
+  only:
+    - tags
+
+cleanup-on-staging:
+  stage: cleanup-staging
+  script:
+    - docker run -t --rm -v $(pwd)/terraform:/cfg 10.188.160.123:8083/ticketmaster/terraformer tm-dev/ci-stage -force destroy
+  environment:
+    name: staging
+  when: always
+  allow_failure: true
+  only:
+    - tags
+
